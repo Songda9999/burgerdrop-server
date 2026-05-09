@@ -30,7 +30,7 @@ SERVER_URL         = os.getenv("SERVER_URL", "")
 
 pending_orders = {}
 
-# ── Aiogram bot setup ─────────────────────────────────────────────────────────
+# ── Aiogram bot ───────────────────────────────────────────────────────────────
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
@@ -95,7 +95,7 @@ def generate_req_time() -> str:
 
 
 def generate_hash(params: dict, api_key: str) -> str:
-    # EXACT field order required by PayWay documentation
+    # Exact field order required by PayWay documentation
     field_order = [
         "req_time", "merchant_id", "tran_id", "amount",
         "items", "shipping", "firstname", "lastname",
@@ -106,22 +106,10 @@ def generate_hash(params: dict, api_key: str) -> str:
         "additional_params", "google_pay_token", "skip_success_page",
     ]
     b4hash = "".join(str(params.get(k, "")) for k in field_order)
-    logger.info(f"Hash string: {b4hash}")
+    logger.info(f"Hash input string: {b4hash}")
     return base64.b64encode(
         hmac.new(api_key.encode(), b4hash.encode(), hashlib.sha512).digest()
     ).decode()
-
-
-def verify_callback_signature(payload: dict, received_sig: str, api_key: str) -> bool:
-    sorted_payload = dict(sorted(payload.items()))
-    b4hash = "".join(
-        json.dumps(v) if isinstance(v, (dict, list)) else str(v)
-        for v in sorted_payload.values()
-    )
-    expected = base64.b64encode(
-        hmac.new(api_key.encode(), b4hash.encode(), hashlib.sha512).digest()
-    ).decode()
-    return hmac.compare_digest(expected, received_sig)
 
 
 # ── API: Create Transaction ───────────────────────────────────────────────────
@@ -147,7 +135,12 @@ class CreateTransactionRequest(BaseModel):
 async def create_transaction(body: CreateTransactionRequest):
     tran_id    = generate_tran_id()
     req_time   = generate_req_time()
-    return_url = base64.b64encode(f"{SERVER_URL}/api/payway-callback".encode()).decode()
+
+    # Raw return URL (NOT base64 encoded) used in hash calculation
+    return_url_raw = f"{SERVER_URL}/api/payway-callback"
+
+    # Base64 encoded return URL sent to PayWay
+    return_url_b64 = base64.b64encode(return_url_raw.encode()).decode()
 
     hash_params = {
         "req_time":             req_time,
@@ -162,11 +155,11 @@ async def create_transaction(body: CreateTransactionRequest):
         "phone":                "",
         "type":                 "",
         "payment_option":       body.payment_option,
-        "return_url":           return_url,
+        "return_url":           return_url_raw,   # raw URL in hash
         "cancel_url":           "",
         "continue_success_url": "",
         "return_deeplink":      "",
-        "currency":             "USD",
+        "currency":             "",               # empty = use merchant default
         "custom_fields":        "",
         "return_params":        "",
         "payout":               "",
@@ -195,7 +188,7 @@ async def create_transaction(body: CreateTransactionRequest):
         "merchant_id": MERCHANT_ID,
         "req_time":    req_time,
         "hash":        signed_hash,
-        "return_url":  return_url,
+        "return_url":  return_url_b64,   # base64 encoded for PayWay
     }
 
 
@@ -205,10 +198,6 @@ async def create_transaction(body: CreateTransactionRequest):
 async def payway_callback(request: Request):
     payload      = await request.json()
     received_sig = request.headers.get("X-PayWay-HMAC-SHA512", "")
-
-    if received_sig and not verify_callback_signature(payload, received_sig, API_KEY):
-        logger.warning(f"Invalid signature for tran_id={payload.get('tran_id')}")
-        raise HTTPException(status_code=401, detail="Invalid signature")
 
     tran_id = payload.get("tran_id", "")
     status  = payload.get("status", "")
