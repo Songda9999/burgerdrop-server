@@ -5,8 +5,8 @@ import json
 import time
 import os
 import logging
-import httpx
 from datetime import datetime
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, HTTPException
@@ -30,19 +30,11 @@ SERVER_URL         = os.getenv("SERVER_URL", "")
 
 PAYWAY_API = "https://checkout-sandbox.payway.com.kh/api/payment-gateway/v1/payments"
 
-app = FastAPI(title="BurgerDrop Server")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
-
 pending_orders = {}
-
-# Global telegram app — initialized in startup
 tg_app: Application = None
 
+
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup(
@@ -56,11 +48,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@app.on_event("startup")
-async def startup():
+# ── FastAPI lifespan (replaces @app.on_event for v21 compatibility) ───────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global tg_app
 
-    # Build telegram app inside startup (not at module level)
+    # Build and start telegram app
     tg_app = Application.builder().token(BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
 
@@ -71,12 +65,21 @@ async def startup():
     await tg_app.bot.set_webhook(webhook_url)
     logger.info(f"✅ Bot started. Webhook: {webhook_url}")
 
+    yield  # app is running
 
-@app.on_event("shutdown")
-async def shutdown():
-    if tg_app:
-        await tg_app.stop()
-        await tg_app.shutdown()
+    # Shutdown
+    await tg_app.stop()
+    await tg_app.shutdown()
+    logger.info("Bot stopped.")
+
+
+app = FastAPI(title="BurgerDrop Server", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 
 @app.post("/telegram-webhook")
