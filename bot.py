@@ -5,6 +5,7 @@ import json
 import time
 import os
 import logging
+import aiohttp
 from datetime import datetime
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -14,8 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 
-from telegram import Update, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -28,48 +29,42 @@ MINI_APP_URL       = os.getenv("MINI_APP_URL", "")
 RESTAURANT_CHAT_ID = int(os.getenv("RESTAURANT_CHAT_ID", "0"))
 SERVER_URL         = os.getenv("SERVER_URL", "")
 
-PAYWAY_API = "https://checkout-sandbox.payway.com.kh/api/payment-gateway/v1/payments"
-
 pending_orders = {}
-tg_app: Application = None
+
+# ── Aiogram bot setup ─────────────────────────────────────────────────────────
+
+bot = Bot(token=BOT_TOKEN)
+dp  = Dispatcher()
 
 
-# ── Telegram handlers ─────────────────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton(text="🍔 Open Menu", web_app=WebAppInfo(url=MINI_APP_URL))]],
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=[[
+            types.KeyboardButton(
+                text="🍔 Open Menu",
+                web_app=types.WebAppInfo(url=MINI_APP_URL)
+            )
+        ]],
         resize_keyboard=True
     )
-    await update.message.reply_text(
+    await message.answer(
         "Welcome to *BurgerDrop* 🍔\n\nFresh smash burgers, delivered fast!\nTap below to browse our menu.",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
 
 
-# ── FastAPI lifespan (replaces @app.on_event for v21 compatibility) ───────────
+# ── FastAPI lifespan ──────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tg_app
-
-    # Build and start telegram app
-    tg_app = Application.builder().token(BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start))
-
-    await tg_app.initialize()
-    await tg_app.start()
-
     webhook_url = f"{SERVER_URL}/telegram-webhook"
-    await tg_app.bot.set_webhook(webhook_url)
-    logger.info(f"✅ Bot started. Webhook: {webhook_url}")
-
-    yield  # app is running
-
-    # Shutdown
-    await tg_app.stop()
-    await tg_app.shutdown()
+    await bot.set_webhook(webhook_url)
+    logger.info(f"✅ Webhook set: {webhook_url}")
+    yield
+    await bot.delete_webhook()
+    await bot.session.close()
     logger.info("Bot stopped.")
 
 
@@ -84,13 +79,13 @@ app.add_middleware(
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
+    data   = await request.json()
+    update = types.Update(**data)
+    await dp.feed_update(bot, update)
     return {"ok": True}
 
 
-# ── PayWay helpers ────────────────────────────────────────────────────────────
+# ── PayWay hash ───────────────────────────────────────────────────────────────
 
 def generate_tran_id() -> str:
     return str(int(time.time() * 1000))[-13:]
@@ -101,12 +96,21 @@ def generate_req_time() -> str:
 
 
 def generate_hash(params: dict, api_key: str) -> str:
-    sorted_keys = sorted(params.keys())
-    b4hash = "".join(str(params[k]) for k in sorted_keys if params[k] != "")
-    signature = base64.b64encode(
+    # EXACT field order required by PayWay documentation
+    field_order = [
+        "req_time", "merchant_id", "tran_id", "amount",
+        "items", "shipping", "firstname", "lastname",
+        "email", "phone", "type", "payment_option",
+        "return_url", "cancel_url", "continue_success_url",
+        "return_deeplink", "currency", "custom_fields",
+        "return_params", "payout", "lifetime",
+        "additional_params", "google_pay_token", "skip_success_page",
+    ]
+    b4hash = "".join(str(params.get(k, "")) for k in field_order)
+    logger.info(f"Hash string: {b4hash}")
+    return base64.b64encode(
         hmac.new(api_key.encode(), b4hash.encode(), hashlib.sha512).digest()
     ).decode()
-    return signature
 
 
 def verify_callback_signature(payload: dict, received_sig: str, api_key: str) -> bool:
@@ -144,18 +148,33 @@ class CreateTransactionRequest(BaseModel):
 async def create_transaction(body: CreateTransactionRequest):
     tran_id    = generate_tran_id()
     req_time   = generate_req_time()
-    return_url = f"{SERVER_URL}/api/payway-callback"
+    return_url = base64.b64encode(f"{SERVER_URL}/api/payway-callback".encode()).decode()
 
     hash_params = {
-        "amount":          body.amount,
-        "currency":        "USD",
-        "firstname":       body.firstname,
-        "lastname":        body.lastname,
-        "merchant_id":     MERCHANT_ID,
-        "payment_option":  body.payment_option,
-        "req_time":        req_time,
-        "return_url":      return_url,
-        "tran_id":         tran_id,
+        "req_time":             req_time,
+        "merchant_id":          MERCHANT_ID,
+        "tran_id":              tran_id,
+        "amount":               body.amount,
+        "items":                "",
+        "shipping":             "",
+        "firstname":            body.firstname,
+        "lastname":             body.lastname,
+        "email":                "",
+        "phone":                "",
+        "type":                 "",
+        "payment_option":       body.payment_option,
+        "return_url":           return_url,
+        "cancel_url":           "",
+        "continue_success_url": "",
+        "return_deeplink":      "",
+        "currency":             "USD",
+        "custom_fields":        "",
+        "return_params":        "",
+        "payout":               "",
+        "lifetime":             "",
+        "additional_params":    "",
+        "google_pay_token":     "",
+        "skip_success_page":    "",
     }
 
     signed_hash = generate_hash(hash_params, API_KEY)
@@ -189,7 +208,7 @@ async def payway_callback(request: Request):
     received_sig = request.headers.get("X-PayWay-HMAC-SHA512", "")
 
     if received_sig and not verify_callback_signature(payload, received_sig, API_KEY):
-        logger.warning(f"Invalid PayWay signature for tran_id={payload.get('tran_id')}")
+        logger.warning(f"Invalid signature for tran_id={payload.get('tran_id')}")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     tran_id = payload.get("tran_id", "")
@@ -200,7 +219,6 @@ async def payway_callback(request: Request):
 
     order = pending_orders.get(tran_id)
     if not order:
-        logger.warning(f"Unknown tran_id: {tran_id}")
         return {"ok": True}
 
     if status == "0":
@@ -232,19 +250,18 @@ async def notify_restaurant(order: dict):
         f"✅ PAID via ABA PayWay\n"
         f"🧾 APV: `{order.get('apv', 'N/A')}`"
     )
-    await tg_app.bot.send_message(
+    await bot.send_message(
         chat_id=RESTAURANT_CHAT_ID,
         text=msg,
         parse_mode="Markdown"
     )
-    logger.info(f"Order {order['tran_id']} sent to restaurant group")
 
 
 async def confirm_customer(order: dict):
     if not order.get("tg_user_id"):
         return
     try:
-        await tg_app.bot.send_message(
+        await bot.send_message(
             chat_id=int(order["tg_user_id"]),
             text=(
                 f"✅ *Payment confirmed!*\n\n"
