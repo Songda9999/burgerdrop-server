@@ -5,7 +5,6 @@ import json
 import time
 import os
 import logging
-import aiohttp
 from datetime import datetime
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
