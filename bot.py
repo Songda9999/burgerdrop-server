@@ -40,8 +40,9 @@ app.add_middleware(
 
 pending_orders = {}
 
-# Build telegram app once at module level
-tg_app = Application.builder().token(BOT_TOKEN).build()
+# Global telegram app — initialized in startup
+tg_app: Application = None
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup(
@@ -54,21 +55,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-tg_app.add_handler(CommandHandler("start", start))
-
 
 @app.on_event("startup")
 async def startup():
+    global tg_app
+
+    # Build telegram app inside startup (not at module level)
+    tg_app = Application.builder().token(BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", start))
+
     await tg_app.initialize()
     await tg_app.start()
+
     webhook_url = f"{SERVER_URL}/telegram-webhook"
     await tg_app.bot.set_webhook(webhook_url)
-    logger.info(f"Webhook set: {webhook_url}")
+    logger.info(f"✅ Bot started. Webhook: {webhook_url}")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    await tg_app.stop()
+    if tg_app:
+        await tg_app.stop()
+        await tg_app.shutdown()
 
 
 @app.post("/telegram-webhook")
@@ -78,6 +86,8 @@ async def telegram_webhook(request: Request):
     await tg_app.process_update(update)
     return {"ok": True}
 
+
+# ── PayWay helpers ────────────────────────────────────────────────────────────
 
 def generate_tran_id() -> str:
     return str(int(time.time() * 1000))[-13:]
@@ -108,6 +118,8 @@ def verify_callback_signature(payload: dict, received_sig: str, api_key: str) ->
     return hmac.compare_digest(expected, received_sig)
 
 
+# ── API: Create Transaction ───────────────────────────────────────────────────
+
 class OrderItem(BaseModel):
     id: int
     name: str
@@ -127,8 +139,8 @@ class CreateTransactionRequest(BaseModel):
 
 @app.post("/api/create-transaction")
 async def create_transaction(body: CreateTransactionRequest):
-    tran_id  = generate_tran_id()
-    req_time = generate_req_time()
+    tran_id    = generate_tran_id()
+    req_time   = generate_req_time()
     return_url = f"{SERVER_URL}/api/payway-callback"
 
     hash_params = {
@@ -166,9 +178,11 @@ async def create_transaction(body: CreateTransactionRequest):
     }
 
 
+# ── API: PayWay Callback ──────────────────────────────────────────────────────
+
 @app.post("/api/payway-callback")
 async def payway_callback(request: Request):
-    payload = await request.json()
+    payload      = await request.json()
     received_sig = request.headers.get("X-PayWay-HMAC-SHA512", "")
 
     if received_sig and not verify_callback_signature(payload, received_sig, API_KEY):
@@ -220,6 +234,7 @@ async def notify_restaurant(order: dict):
         text=msg,
         parse_mode="Markdown"
     )
+    logger.info(f"Order {order['tran_id']} sent to restaurant group")
 
 
 async def confirm_customer(order: dict):
@@ -240,6 +255,8 @@ async def confirm_customer(order: dict):
     except Exception as e:
         logger.warning(f"Could not message customer: {e}")
 
+
+# ── Health check ──────────────────────────────────────────────────────────────
 
 @app.get("/")
 def health():
